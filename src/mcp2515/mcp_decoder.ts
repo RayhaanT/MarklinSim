@@ -1,18 +1,19 @@
 /**
- * Decodes MCP2515 SPI byte stream into CAN frames.
+ * Decodes and encodes MCP2515 SPI traffic.
  *
- * The MCP2515 SPI protocol uses these instructions:
+ * Processes the SPI byte stream one byte at a time, maintaining internal
+ * register state. For each TX byte from the kernel, returns an RX response
+ * byte (encoder) and optionally a decoded CAN frame (decoder).
+ *
+ * MCP2515 SPI instructions:
  *   0x02 (WRITE):       [instruction, register, data...]
  *   0x03 (READ):        [instruction, register, dummy...]
  *   0x05 (BIT_MODIFY):  [instruction, register, mask, data]
  *   0xA0 (READ_STATUS): [instruction, dummy]
  *
- * CAN TX frames are detected as multi-byte WRITEs to register 0x31 (TXB0 SIDH).
- * The data layout is: [SIDH, SIDL, EID8, EID0, DLC, D0, ..., Dn]
- *
- * This decoder processes bytes one at a time (like MarklinDecoder) and uses
- * MCP2515 protocol knowledge to determine transaction boundaries. Multi-byte
- * READs are not fully tracked since their length is not encoded in the stream.
+ * For READs, successive dummy bytes (non-instruction values) return
+ * successive register values with auto-incrementing address.
+ * For WRITEs, successive data bytes write to successive registers.
  */
 
 export interface CanFrame {
@@ -22,23 +23,48 @@ export interface CanFrame {
     data: number[];
 }
 
+export interface DecodeResult {
+    rx: number;
+    frame: CanFrame | null;
+}
+
 // MCP2515 SPI instructions
 const INSTRUCTION_WRITE       = 0x02;
 const INSTRUCTION_READ        = 0x03;
 const INSTRUCTION_BIT_MODIFY  = 0x05;
 const INSTRUCTION_READ_STATUS = 0xA0;
 
-// TX buffer 0 register addresses
+const INSTRUCTION_NAME: Record<number, string> = {
+    [INSTRUCTION_WRITE]:       'WRITE',
+    [INSTRUCTION_READ]:        'READ',
+    [INSTRUCTION_BIT_MODIFY]:  'BIT_MODIFY',
+    [INSTRUCTION_READ_STATUS]: 'READ_STATUS',
+};
+
+function hex(n: number): string { return '0x' + n.toString(16).padStart(2, '0'); }
+
+// TX buffer 0 registers
 const TXB0_SIDH = 0x31;
+const TXB0_SIDL = 0x32;
+
+// RX buffer 0 registers
+const RXB0_SIDH = 0x61;
+const RXB0_SIDL = 0x62;
+
+// Registers used for READ_STATUS computation
+const CANINTF  = 0x2C;
+const TXB0CTRL = 0x30;
+const TXB1CTRL = 0x40;
+const TXB2CTRL = 0x50;
 
 const enum State {
     IDLE,
     WRITE_ADDR,
-    WRITE_SINGLE,
+    WRITE_DATA,
     TX_HEADER,
     TX_DATA,
     READ_ADDR,
-    READ_DUMMY,
+    READ_DATA,
     BIT_MODIFY_ADDR,
     BIT_MODIFY_MASK,
     BIT_MODIFY_DATA,
@@ -47,79 +73,134 @@ const enum State {
 
 export class McpDecoder {
     private state: State = State.IDLE;
+    private register: number = 0;
+    private bitModifyMask: number = 0;
     private txHeader: number[] = [];
     private txData: number[] = [];
     private txDlc: number = 0;
 
+    private readonly registers = new Uint8Array(256);
+
     /**
-     * Process a single byte from the SPI stream.
-     * Returns a CanFrame when a complete TX frame is decoded, null otherwise.
+     * Process a single TX byte from the SPI stream.
+     * Returns the RX response byte and any decoded CAN frame.
      */
-    public decode(byte: number): CanFrame | null {
+    public decode(txByte: number): DecodeResult {
         switch (this.state) {
             case State.IDLE:
-                return this.decodeInstruction(byte);
+                return this.handleInstruction(txByte);
 
             case State.WRITE_ADDR:
-                if (byte === TXB0_SIDH) {
+                this.register = txByte;
+                if (txByte === TXB0_SIDH) {
                     this.state = State.TX_HEADER;
                     this.txHeader = [];
                 } else {
-                    this.state = State.WRITE_SINGLE;
+                    this.state = State.WRITE_DATA;
                 }
-                return null;
+                return { rx: 0, frame: null };
 
-            case State.WRITE_SINGLE:
-                this.state = State.IDLE;
-                return null;
+            case State.WRITE_DATA:
+                if (this.isInstruction(txByte)) {
+                    return this.handleInstruction(txByte);
+                }
+                console.log(`  WRITE reg[${hex(this.register)}] = ${hex(txByte)}`);
+                this.registers[this.register & 0xFF] = txByte;
+                // Auto-clear TXREQ when kernel requests transmit —
+                // simulates MCP2515 completing the transmission instantly.
+                if (this.register === TXB0CTRL && (txByte & 0x08)) {
+                    this.registers[TXB0CTRL] &= ~0x08;
+                }
+                this.register = (this.register + 1) & 0xFF;
+                return { rx: 0, frame: null };
 
             case State.TX_HEADER:
-                this.txHeader.push(byte);
+                this.registers[(TXB0_SIDH + this.txHeader.length) & 0xFF] = txByte;
+                this.txHeader.push(txByte);
                 if (this.txHeader.length === 5) {
                     this.txDlc = this.txHeader[4] & 0x0F;
                     if (this.txDlc === 0) {
-                        return this.emitCanFrame();
+                        return { rx: 0, frame: this.emitCanFrame() };
                     }
                     this.txData = [];
                     this.state = State.TX_DATA;
                 }
-                return null;
+                return { rx: 0, frame: null };
 
             case State.TX_DATA:
-                this.txData.push(byte);
+                this.registers[(TXB0_SIDH + 5 + this.txData.length) & 0xFF] = txByte;
+                this.txData.push(txByte);
                 if (this.txData.length === this.txDlc) {
-                    return this.emitCanFrame();
+                    return { rx: 0, frame: this.emitCanFrame() };
                 }
-                return null;
+                return { rx: 0, frame: null };
 
             case State.READ_ADDR:
-                this.state = State.READ_DUMMY;
-                return null;
+                this.register = txByte;
+                this.state = State.READ_DATA;
+                return { rx: 0, frame: null };
 
-            case State.READ_DUMMY:
-                this.state = State.IDLE;
-                return null;
+            case State.READ_DATA:
+                if (this.isInstruction(txByte)) {
+                    return this.handleInstruction(txByte);
+                }
+                const val = this.registers[this.register & 0xFF];
+                console.log(`  READ reg[${hex(this.register)}] -> ${hex(val)}`);
+                this.register = (this.register + 1) & 0xFF;
+                return { rx: val, frame: null };
 
             case State.BIT_MODIFY_ADDR:
+                this.register = txByte;
                 this.state = State.BIT_MODIFY_MASK;
-                return null;
+                return { rx: 0, frame: null };
 
             case State.BIT_MODIFY_MASK:
+                this.bitModifyMask = txByte;
                 this.state = State.BIT_MODIFY_DATA;
-                return null;
+                return { rx: 0, frame: null };
 
-            case State.BIT_MODIFY_DATA:
+            case State.BIT_MODIFY_DATA: {
+                const addr = this.register & 0xFF;
+                const oldVal = this.registers[addr];
+                this.registers[addr] =
+                    (oldVal & ~this.bitModifyMask) |
+                    (txByte & this.bitModifyMask);
+                console.log(`  BIT_MODIFY reg[${hex(addr)}] mask=${hex(this.bitModifyMask)} data=${hex(txByte)}: ${hex(oldVal)} -> ${hex(this.registers[addr])}`);
                 this.state = State.IDLE;
-                return null;
+                return { rx: 0, frame: null };
+            }
 
-            case State.READ_STATUS_DUMMY:
+            case State.READ_STATUS_DUMMY: {
                 this.state = State.IDLE;
-                return null;
+                const status = this.computeStatus();
+                return { rx: status, frame: null };
+            }
         }
     }
 
-    private decodeInstruction(byte: number): null {
-        switch (byte) {
+    public setRegister(addr: number, value: number): void {
+        this.registers[addr & 0xFF] = value;
+    }
+
+    public getRegister(addr: number): number {
+        return this.registers[addr & 0xFF];
+    }
+
+    private isInstruction(byte: number): boolean {
+        return byte === INSTRUCTION_WRITE
+            || byte === INSTRUCTION_READ
+            || byte === INSTRUCTION_BIT_MODIFY
+            || byte === INSTRUCTION_READ_STATUS;
+    }
+
+    private handleInstruction(txByte: number): DecodeResult {
+        if (txByte !== INSTRUCTION_READ_STATUS) {
+            const name = INSTRUCTION_NAME[txByte];
+            if (name) {
+                console.log(`[MCP2515] ${name} (${hex(txByte)})`);
+            }
+        }
+        switch (txByte) {
             case INSTRUCTION_WRITE:
                 this.state = State.WRITE_ADDR;
                 break;
@@ -133,10 +214,29 @@ export class McpDecoder {
                 this.state = State.READ_STATUS_DUMMY;
                 break;
             default:
-                // Unknown byte in IDLE state; skip it.
                 break;
         }
-        return null;
+        return { rx: 0, frame: null };
+    }
+
+    /**
+     * Compute READ_STATUS (0xA0) response from register state.
+     *
+     * Bit 0: CANINTF.RX0IF    Bit 1: CANINTF.RX1IF
+     * Bit 2: TXB0CTRL.TXREQ   Bit 3: CANINTF.TX0IF
+     * Bit 4: TXB1CTRL.TXREQ   Bit 5: CANINTF.TX1IF
+     * Bit 6: TXB2CTRL.TXREQ   Bit 7: CANINTF.TX2IF
+     */
+    private computeStatus(): number {
+        const canintf = this.registers[CANINTF];
+        return ((canintf >> 0) & 1)
+             | (((canintf >> 1) & 1) << 1)
+             | (((this.registers[TXB0CTRL] >> 3) & 1) << 2)
+             | (((canintf >> 2) & 1) << 3)
+             | (((this.registers[TXB1CTRL] >> 3) & 1) << 4)
+             | (((canintf >> 3) & 1) << 5)
+             | (((this.registers[TXB2CTRL] >> 3) & 1) << 6)
+             | (((canintf >> 4) & 1) << 7);
     }
 
     /**
@@ -161,6 +261,22 @@ export class McpDecoder {
             dlc:  this.txDlc,
             data: this.txData.slice(),
         };
+
+        const dataStr = frame.data.map(hex).join(' ');
+        console.log(`[MCP2515] CAN TX: id=${frame.id} eid=${frame.eid} dlc=${frame.dlc} data=[${dataStr}]`);
+
+        // Echo frame into RX buffer 0 as an ACK response.
+        // Copy TX header + data (0x31..0x3D) to RX registers (0x61..0x6D).
+        const frameLen = 5 + this.txDlc;
+        for (let i = 0; i < frameLen; i++) {
+            this.registers[RXB0_SIDH + i] = this.registers[TXB0_SIDH + i];
+        }
+        // Set the response bit (eid bit 16 = SIDL bit 0) so the kernel
+        // treats this as a CS3 ACK rather than ignoring it.
+        this.registers[RXB0_SIDL] |= 0x01;
+        // Signal RX0IF so READ_STATUS reports a received frame.
+        this.registers[CANINTF] |= 0x01;
+        console.log(`[MCP2515] Echo -> RXB0 (ACK)`);
 
         this.state = State.IDLE;
         return frame;
