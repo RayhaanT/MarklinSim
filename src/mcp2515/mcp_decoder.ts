@@ -43,13 +43,11 @@ const INSTRUCTION_NAME: Record<number, string> = {
 
 function hex(n: number): string { return '0x' + n.toString(16).padStart(2, '0'); }
 
-// TX buffer 0 registers
+// TX buffer 0 start register
 const TXB0_SIDH = 0x31;
-const TXB0_SIDL = 0x32;
 
-// RX buffer 0 registers
+// RX buffer 0 start register
 const RXB0_SIDH = 0x61;
-const RXB0_SIDL = 0x62;
 
 // Registers used for READ_STATUS computation
 const CANINTF  = 0x2C;
@@ -71,6 +69,8 @@ const enum State {
     READ_STATUS_DUMMY,
 }
 
+export type TxFrameCallback = (frame: CanFrame) => void;
+
 export class McpDecoder {
     private state: State = State.IDLE;
     private register: number = 0;
@@ -80,6 +80,40 @@ export class McpDecoder {
     private txDlc: number = 0;
 
     private readonly registers = new Uint8Array(256);
+    private txFrameCallback: TxFrameCallback | null = null;
+    private rxQueue: CanFrame[] = [];
+
+    public setTxFrameCallback(cb: TxFrameCallback): void {
+        this.txFrameCallback = cb;
+    }
+
+    /** Queue CAN frames to be loaded into RXB0 as they become available. */
+    public queueRxFrames(frames: CanFrame[]): void {
+        for (const f of frames) {
+            this.rxQueue.push(f);
+        }
+        this.tryLoadNextRxFrame();
+    }
+
+    /** If RXB0 is free (CANINTF.RX0IF clear) and queue non-empty, load next frame. */
+    private tryLoadNextRxFrame(): void {
+        if ((this.registers[CANINTF] & 0x01) === 0 && this.rxQueue.length > 0) {
+            this.loadFrameToRxb0(this.rxQueue.shift()!);
+        }
+    }
+
+    /** Encode a CAN frame into RXB0 registers and set CANINTF.RX0IF. */
+    private loadFrameToRxb0(frame: CanFrame): void {
+        this.registers[RXB0_SIDH]     = (frame.id >> 3) & 0xFF;
+        this.registers[RXB0_SIDH + 1] = ((frame.id & 0x07) << 5) | 0x08 | ((frame.eid >> 16) & 0x03);
+        this.registers[RXB0_SIDH + 2] = (frame.eid >> 8) & 0xFF;
+        this.registers[RXB0_SIDH + 3] = frame.eid & 0xFF;
+        this.registers[RXB0_SIDH + 4] = frame.dlc;
+        for (let i = 0; i < frame.dlc; i++) {
+            this.registers[RXB0_SIDH + 5 + i] = frame.data[i];
+        }
+        this.registers[CANINTF] |= 0x01;
+    }
 
     /**
      * Process a single TX byte from the SPI stream.
@@ -110,6 +144,10 @@ export class McpDecoder {
                 // simulates MCP2515 completing the transmission instantly.
                 if (this.register === TXB0CTRL && (txByte & 0x08)) {
                     this.registers[TXB0CTRL] &= ~0x08;
+                }
+                // When kernel clears CANINTF, load next queued RX frame.
+                if ((this.register & 0xFF) === CANINTF) {
+                    this.tryLoadNextRxFrame();
                 }
                 this.register = (this.register + 1) & 0xFF;
                 return { rx: 0, frame: null };
@@ -166,6 +204,9 @@ export class McpDecoder {
                     (oldVal & ~this.bitModifyMask) |
                     (txByte & this.bitModifyMask);
                 console.log(`  BIT_MODIFY reg[${hex(addr)}] mask=${hex(this.bitModifyMask)} data=${hex(txByte)}: ${hex(oldVal)} -> ${hex(this.registers[addr])}`);
+                if (addr === CANINTF) {
+                    this.tryLoadNextRxFrame();
+                }
                 this.state = State.IDLE;
                 return { rx: 0, frame: null };
             }
@@ -265,18 +306,9 @@ export class McpDecoder {
         const dataStr = frame.data.map(hex).join(' ');
         console.log(`[MCP2515] CAN TX: id=${frame.id} eid=${frame.eid} dlc=${frame.dlc} data=[${dataStr}]`);
 
-        // Echo frame into RX buffer 0 as an ACK response.
-        // Copy TX header + data (0x31..0x3D) to RX registers (0x61..0x6D).
-        const frameLen = 5 + this.txDlc;
-        for (let i = 0; i < frameLen; i++) {
-            this.registers[RXB0_SIDH + i] = this.registers[TXB0_SIDH + i];
+        if (this.txFrameCallback) {
+            this.txFrameCallback(frame);
         }
-        // Set the response bit (eid bit 16 = SIDL bit 0) so the kernel
-        // treats this as a CS3 ACK rather than ignoring it.
-        this.registers[RXB0_SIDL] |= 0x01;
-        // Signal RX0IF so READ_STATUS reports a received frame.
-        this.registers[CANINTF] |= 0x01;
-        console.log(`[MCP2515] Echo -> RXB0 (ACK)`);
 
         this.state = State.IDLE;
         return frame;

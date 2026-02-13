@@ -210,9 +210,9 @@ export class TrackA {
     }
 
     private static createTrains(trains: Train[], tracks: Track[]) {
-        TrainFactory.train(trains, 24);
-        trains[24].putOnTrack(tracks[0x100], true);
-        TrainFactory.train(trains, 58);
-        trains[58].putOnTrack(tracks[0x150], true);
+        TrainFactory.train(trains, 13);
+        trains[13].putOnTrack(tracks[0x100], true);
+        TrainFactory.train(trains, 55);
+        trains[55].putOnTrack(tracks[0x150], true);
     }
 }

@@ -6,6 +6,7 @@ import { TrackA } from "./marklin/setup/track_a";
 import { ElectronApp } from "./electron_app";
 import { ipcMain, IpcMainEvent } from "electron";
 import { ITickPayload } from "./util/tick_payload";
+import { McpIO } from "./mcp2515/mcp_io";
 
 const io = new MarklinIO();
 io.listenTCP(config.SOCKET_PORT);
@@ -16,6 +17,10 @@ io.setController(controller);
 
 // TrackDrift.setup(controller);
 TrackA.setup(controller);
+
+// SPI bridge to QEMU's MCP2515 chardev
+const mcpIo = new McpIO(controller);
+mcpIo.connect('localhost', 5555);
 
 const eApp = new ElectronApp();
 eApp.start();

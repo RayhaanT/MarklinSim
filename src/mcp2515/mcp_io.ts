@@ -1,42 +1,71 @@
 /**
- * Standalone bridge: connects to QEMU's SPI chardev TCP port
- * and runs the MCP2515 decoder/encoder on the byte stream.
+ * SPI bridge: connects to QEMU's SPI chardev TCP port,
+ * decodes MCP2515 traffic, and dispatches CS3 CAN commands
+ * to the MarklinSim controller.
  *
- * Usage:
+ * Can be used standalone (just ACKs, no sim) or integrated
+ * into the main app with a MarklinController.
+ *
+ * Standalone usage:
  *   npx tsx src/mcp2515/mcp_io.ts [host] [port]
- *
- * Start QEMU first (make test in the a0 directory), then run this.
  */
 import * as net from 'net';
-import { McpDecoder } from './mcp_decoder';
+import { McpDecoder, CanFrame } from './mcp_decoder';
+import { Cs3Handler } from './cs3_handler';
+import { MarklinController } from '../marklin/marklin_controller';
 
-const host = process.argv[2] || 'localhost';
-const port = parseInt(process.argv[3] || '5555', 10);
+export class McpIO {
+    private socket: net.Socket | null = null;
+    private readonly decoder: McpDecoder;
+    private readonly handler: Cs3Handler;
 
-const decoder = new McpDecoder();
+    constructor(controller?: MarklinController) {
+        this.decoder = new McpDecoder();
+        this.handler = new Cs3Handler();
 
-console.log(`[MCP IO] Connecting to QEMU SPI at ${host}:${port}...`);
+        if (controller) {
+            this.handler.setController(controller);
+        }
 
-const socket = net.createConnection({ host, port }, () => {
-    socket.setNoDelay(true);
-    console.log(`[MCP IO] Connected.`);
-});
-
-socket.on('data', (data: Buffer) => {
-    const rxBuf = Buffer.alloc(data.length);
-    for (let i = 0; i < data.length; i++) {
-        const result = decoder.decode(data[i]);
-        rxBuf[i] = result.rx;
+        this.decoder.setTxFrameCallback((frame: CanFrame) => {
+            const ackFrames = this.handler.handleTxFrame(frame);
+            if (ackFrames.length > 0) {
+                this.decoder.queueRxFrames(ackFrames);
+            }
+        });
     }
-    socket.write(rxBuf);
-});
 
-socket.on('close', () => {
-    console.log('[MCP IO] Disconnected.');
-    process.exit(0);
-});
+    public connect(host: string = 'localhost', port: number = 5555): void {
+        console.log(`[MCP IO] Connecting to QEMU SPI at ${host}:${port}...`);
 
-socket.on('error', (err: Error) => {
-    console.error(`[MCP IO] ${err.message}`);
-    process.exit(1);
-});
+        this.socket = net.createConnection({ host, port }, () => {
+            this.socket!.setNoDelay(true);
+            console.log(`[MCP IO] Connected.`);
+        });
+
+        this.socket.on('data', (data: Buffer) => {
+            const rxBuf = Buffer.alloc(data.length);
+            for (let i = 0; i < data.length; i++) {
+                const result = this.decoder.decode(data[i]);
+                rxBuf[i] = result.rx;
+            }
+            this.socket!.write(rxBuf);
+        });
+
+        this.socket.on('close', () => {
+            console.log('[MCP IO] Disconnected.');
+        });
+
+        this.socket.on('error', (err: Error) => {
+            console.error(`[MCP IO] ${err.message}`);
+        });
+    }
+}
+
+// Standalone mode
+if (require.main === module) {
+    const host = process.argv[2] || 'localhost';
+    const port = parseInt(process.argv[3] || '5555', 10);
+    const io = new McpIO();
+    io.connect(host, port);
+}
