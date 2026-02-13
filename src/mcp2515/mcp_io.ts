@@ -16,6 +16,7 @@ import { MarklinController } from '../marklin/marklin_controller';
 
 export class McpIO {
     private socket: net.Socket | null = null;
+    private gpioSocket: net.Socket | null = null;
     private readonly decoder: McpDecoder;
     private readonly handler: Cs3Handler;
 
@@ -31,16 +32,18 @@ export class McpIO {
             const ackFrames = this.handler.handleTxFrame(frame);
             if (ackFrames.length > 0) {
                 this.decoder.queueRxFrames(ackFrames);
+                // Trigger GPIO interrupt when RX frames are queued
+                this.triggerGpioInterrupt();
             }
         });
     }
 
-    public connect(host: string = 'localhost', port: number = 5555): void {
+    public connect(host: string = 'localhost', port: number = 5555, gpioPort: number = 5556): void {
         console.log(`[MCP IO] Connecting to QEMU SPI at ${host}:${port}...`);
 
         this.socket = net.createConnection({ host, port }, () => {
             this.socket!.setNoDelay(true);
-            console.log(`[MCP IO] Connected.`);
+            console.log(`[MCP IO] Connected to SPI.`);
         });
 
         this.socket.on('data', (data: Buffer) => {
@@ -53,12 +56,44 @@ export class McpIO {
         });
 
         this.socket.on('close', () => {
-            console.log('[MCP IO] Disconnected.');
+            console.log('[MCP IO] SPI disconnected.');
         });
 
         this.socket.on('error', (err: Error) => {
-            console.error(`[MCP IO] ${err.message}`);
+            console.error(`[MCP IO] SPI error: ${err.message}`);
         });
+
+        // Connect to GPIO chardev for triggering interrupts
+        console.log(`[MCP IO] Connecting to QEMU GPIO at ${host}:${gpioPort}...`);
+        this.gpioSocket = net.createConnection({ host, port: gpioPort }, () => {
+            this.gpioSocket!.setNoDelay(true);
+            console.log(`[MCP IO] Connected to GPIO.`);
+        });
+
+        this.gpioSocket.on('close', () => {
+            console.log('[MCP IO] GPIO disconnected.');
+        });
+
+        this.gpioSocket.on('error', (err: Error) => {
+            console.error(`[MCP IO] GPIO error: ${err.message}`);
+        });
+    }
+
+    /**
+     * Trigger a GPIO interrupt on pin 17.
+     * Sends a rising edge (pin 17 = 1), then falling edge (pin 17 = 0)
+     * to trigger the MCP2515 interrupt handler in the kernel.
+     */
+    private triggerGpioInterrupt(): void {
+        if (!this.gpioSocket) {
+            return;
+        }
+        // Protocol: [pin_number, level]
+        // Rising edge on pin 17
+        console.log('[MCP IO] Interrupting on GPIO pin');
+        this.gpioSocket.write(Buffer.from([17, 1]));
+        // Falling edge on pin 17 (clear interrupt line)
+        this.gpioSocket.write(Buffer.from([17, 0]));
     }
 }
 

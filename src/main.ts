@@ -20,7 +20,7 @@ TrackA.setup(controller);
 
 // SPI bridge to QEMU's MCP2515 chardev
 const mcpIo = new McpIO(controller);
-mcpIo.connect('localhost', 5555);
+mcpIo.connect('localhost', 5555, 5556);
 
 const eApp = new ElectronApp();
 eApp.start();
