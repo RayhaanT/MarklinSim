@@ -29,11 +29,18 @@ export class McpIO {
         }
 
         this.decoder.setTxFrameCallback((frame: CanFrame) => {
+            // TX buffer becomes empty - trigger interrupt if TX0IE is enabled
+            if (this.decoder.shouldTriggerInterrupt()) {
+                this.triggerGpioInterrupt();
+            }
+
             const ackFrames = this.handler.handleTxFrame(frame);
             if (ackFrames.length > 0) {
                 this.decoder.queueRxFrames(ackFrames);
-                // Trigger GPIO interrupt when RX frames are queued
-                this.triggerGpioInterrupt();
+                // RX frames queued - trigger interrupt if RX0IE is enabled
+                if (this.decoder.shouldTriggerInterrupt()) {
+                    this.triggerGpioInterrupt();
+                }
             }
         });
     }
@@ -56,7 +63,8 @@ export class McpIO {
         });
 
         this.socket.on('close', () => {
-            console.log('[MCP IO] SPI disconnected.');
+            console.log('[MCP IO] SPI disconnected. Exiting...');
+            process.exit(0);
         });
 
         this.socket.on('error', (err: Error) => {
@@ -71,7 +79,8 @@ export class McpIO {
         });
 
         this.gpioSocket.on('close', () => {
-            console.log('[MCP IO] GPIO disconnected.');
+            console.log('[MCP IO] GPIO disconnected. Exiting...');
+            process.exit(0);
         });
 
         this.gpioSocket.on('error', (err: Error) => {

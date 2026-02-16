@@ -50,10 +50,18 @@ const TXB0_SIDH = 0x31;
 const RXB0_SIDH = 0x61;
 
 // Registers used for READ_STATUS computation
+const CANINTE  = 0x2B;
 const CANINTF  = 0x2C;
 const TXB0CTRL = 0x30;
 const TXB1CTRL = 0x40;
 const TXB2CTRL = 0x50;
+
+// CANINTF/CANINTE bit definitions
+const RX0IF = 0x01;  // RX Buffer 0 Full Interrupt Flag
+const RX1IF = 0x02;  // RX Buffer 1 Full Interrupt Flag
+const TX0IF = 0x04;  // TX Buffer 0 Empty Interrupt Flag
+const TX1IF = 0x08;  // TX Buffer 1 Empty Interrupt Flag
+const TX2IF = 0x10;  // TX Buffer 2 Empty Interrupt Flag
 
 const enum State {
     IDLE,
@@ -97,7 +105,7 @@ export class McpDecoder {
 
     /** If RXB0 is free (CANINTF.RX0IF clear) and queue non-empty, load next frame. */
     private tryLoadNextRxFrame(): void {
-        if ((this.registers[CANINTF] & 0x01) === 0 && this.rxQueue.length > 0) {
+        if ((this.registers[CANINTF] & RX0IF) === 0 && this.rxQueue.length > 0) {
             this.loadFrameToRxb0(this.rxQueue.shift()!);
         }
     }
@@ -112,7 +120,16 @@ export class McpDecoder {
         for (let i = 0; i < frame.dlc; i++) {
             this.registers[RXB0_SIDH + 5 + i] = frame.data[i];
         }
-        this.registers[CANINTF] |= 0x01;
+        this.registers[CANINTF] |= RX0IF;
+    }
+
+    /**
+     * Check if the INT pin should be asserted.
+     * INT is active-low and asserts when any enabled interrupt flag is set.
+     * Returns true if interrupt should be triggered.
+     */
+    public shouldTriggerInterrupt(): boolean {
+        return (this.registers[CANINTF] & this.registers[CANINTE]) !== 0;
     }
 
     /**
@@ -305,6 +322,9 @@ export class McpDecoder {
 
         const dataStr = frame.data.map(hex).join(' ');
         console.log(`[MCP2515] CAN TX: id=${frame.id} eid=${frame.eid} dlc=${frame.dlc} data=[${dataStr}]`);
+
+        // Set TX0IF to indicate transmit buffer is now empty
+        this.registers[CANINTF] |= TX0IF;
 
         if (this.txFrameCallback) {
             this.txFrameCallback(frame);
