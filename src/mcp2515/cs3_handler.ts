@@ -80,7 +80,7 @@ export class Cs3Handler {
         // Bits 7-1: 0b0001000 = 0x08, so id = 0x08
         // Bit 0: 1, so eid bit 17 = 1
         const id = 0x08;
-        const eid = (1 << 17) | (sensorId & 0xFFFF);  // bit 17 set, lower bits = sensor ID
+        const eid = (1 << 17) | (sensorId & 0xFFFF) | 0x10000;  // bit 17 set, lower bits = sensor ID
 
         const data = [
             (sensorId >> 24) & 0xFF,
