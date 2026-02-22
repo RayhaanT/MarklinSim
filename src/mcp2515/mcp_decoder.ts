@@ -176,10 +176,12 @@ export class McpDecoder {
                 }
                 console.log(`  WRITE reg[${hex(this.register)}] = ${hex(txByte)}`);
                 this.registers[this.register & 0xFF] = txByte;
-                // Auto-clear TXREQ when kernel requests transmit —
-                // simulates MCP2515 completing the transmission instantly.
+                // When TXREQ is set on TXB0CTRL, emit the buffered frame
+                // and auto-clear TXREQ to simulate instant transmission.
                 if (this.register === TXB0CTRL && (txByte & 0x08)) {
                     this.registers[TXB0CTRL] &= ~0x08;
+                    this.register = (this.register + 1) & 0xFF;
+                    return { rx: 0, frame: this.emitCanFrame() };
                 }
                 // When kernel writes CANINTF, update INT pin and load next queued RX frame.
                 if ((this.register & 0xFF) === CANINTF) {
@@ -195,10 +197,12 @@ export class McpDecoder {
                 if (this.txHeader.length === 5) {
                     this.txDlc = this.txHeader[4] & 0x0F;
                     if (this.txDlc === 0) {
-                        return { rx: 0, frame: this.emitCanFrame() };
+                        this.txData = [];
+                        this.state = State.IDLE;
+                    } else {
+                        this.txData = [];
+                        this.state = State.TX_DATA;
                     }
-                    this.txData = [];
-                    this.state = State.TX_DATA;
                 }
                 return { rx: 0, frame: null };
 
@@ -206,7 +210,7 @@ export class McpDecoder {
                 this.registers[(TXB0_SIDH + 5 + this.txData.length) & 0xFF] = txByte;
                 this.txData.push(txByte);
                 if (this.txData.length === this.txDlc) {
-                    return { rx: 0, frame: this.emitCanFrame() };
+                    this.state = State.IDLE;
                 }
                 return { rx: 0, frame: null };
 
@@ -241,6 +245,11 @@ export class McpDecoder {
                     (oldVal & ~this.bitModifyMask) |
                     (txByte & this.bitModifyMask);
                 console.log(`  BIT_MODIFY reg[${hex(addr)}] mask=${hex(this.bitModifyMask)} data=${hex(txByte)}: ${hex(oldVal)} -> ${hex(this.registers[addr])}`);
+                if (addr === TXB0CTRL && (this.registers[TXB0CTRL] & 0x08)) {
+                    this.registers[TXB0CTRL] &= ~0x08;
+                    this.state = State.IDLE;
+                    return { rx: 0, frame: this.emitCanFrame() };
+                }
                 if (addr === CANINTF) {
                     this.updateIntPin();
                     this.tryLoadNextRxFrame();
