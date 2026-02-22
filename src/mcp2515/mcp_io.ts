@@ -39,9 +39,14 @@ export class McpIO {
         });
 
         this.decoder.setTxFrameCallback((frame: CanFrame) => {
-            const ackFrames = this.handler.handleTxFrame(frame);
-            if (ackFrames.length > 0) {
-                this.decoder.queueRxFrames(ackFrames);
+            const result = this.handler.handleTxFrame(frame);
+            if (result.immediate.length > 0) {
+                this.decoder.queueRxFrames(result.immediate);
+            }
+            if (result.delayed.length > 0) {
+                setTimeout(() => {
+                    this.decoder.queueRxFrames(result.delayed);
+                }, 800);
             }
         });
     }

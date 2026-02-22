@@ -58,6 +58,11 @@ function decodeSwitchId(encodedId: number): number {
     return encodedId - 0x3000 + 1;
 }
 
+export interface HandleResult {
+    immediate: CanFrame[];
+    delayed: CanFrame[];
+}
+
 export class Cs3Handler {
     private controller: MarklinController | null = null;
     private trainLights: Map<number, boolean> = new Map();
@@ -96,7 +101,7 @@ export class Cs3Handler {
         return { id, eid, dlc: 8, data };
     }
 
-    public handleTxFrame(frame: CanFrame): CanFrame[] {
+    public handleTxFrame(frame: CanFrame): HandleResult {
         const command = decodeCommand(frame);
         const ack = makeAck(frame);
 
@@ -108,22 +113,22 @@ export class Cs3Handler {
             case SWITCH_CMD:    return this.handleSwitch(frame, ack);
             default:
                 console.log(`[CS3] Unknown command: 0x${command.toString(16).padStart(2, '0')}`);
-                return [ack];
+                return { immediate: [ack], delayed: [] };
         }
     }
 
-    private handleSystem(frame: CanFrame, ack: CanFrame): CanFrame[] {
+    private handleSystem(frame: CanFrame, ack: CanFrame): HandleResult {
         const subcmd = frame.data[4];
         console.log(`[CS3] SYSTEM ${SUBCMD_NAME[subcmd] ?? subcmd}`);
-        return [ack];
+        return { immediate: [ack], delayed: [] };
     }
 
-    private handleSpeed(frame: CanFrame, ack: CanFrame): CanFrame[] {
+    private handleSpeed(frame: CanFrame, ack: CanFrame): HandleResult {
         const trainId = readId(frame.data);
 
         if (frame.dlc <= 4) {
             console.log(`[CS3] SPEED QUERY train=${trainId}`);
-            return [ack];
+            return { immediate: [ack], delayed: [] };
         }
 
         const cs3Speed = (frame.data[4] << 8) | frame.data[5];
@@ -134,29 +139,29 @@ export class Cs3Handler {
         if (this.controller) {
             this.controller.setTrainSpeed(trainId, simSpeed, light);
         }
-        return [ack];
+        return { immediate: [ack], delayed: [] };
     }
 
-    private handleDirection(frame: CanFrame, ack: CanFrame): CanFrame[] {
+    private handleDirection(frame: CanFrame, ack: CanFrame): HandleResult {
         const trainId = readId(frame.data);
         console.log(`[CS3] REVERSE train=${trainId}`);
 
         if (this.controller) {
             this.controller.reverseTrain(trainId);
         }
-        return [ack];
+        return { immediate: [ack], delayed: [] };
     }
 
-    private handleLight(frame: CanFrame, ack: CanFrame): CanFrame[] {
+    private handleLight(frame: CanFrame, ack: CanFrame): HandleResult {
         const trainId = readId(frame.data);
         const on = frame.data[5] !== 0;
         console.log(`[CS3] LIGHT train=${trainId} on=${on}`);
 
         this.trainLights.set(trainId, on);
-        return [ack];
+        return { immediate: [ack], delayed: [] };
     }
 
-    private handleSwitch(frame: CanFrame, ack: CanFrame): CanFrame[] {
+    private handleSwitch(frame: CanFrame, ack: CanFrame): HandleResult {
         const encodedId = readId(frame.data);
         const switchId = decodeSwitchId(encodedId);
         const position = frame.data[4];
@@ -168,6 +173,6 @@ export class Cs3Handler {
         if (this.controller) {
             this.controller.changeSwitchDirection(switchId, direction);
         }
-        return [ack, ack];
+        return { immediate: [ack], delayed: [ack] };
     }
 }

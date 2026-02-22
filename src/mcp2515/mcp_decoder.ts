@@ -46,8 +46,9 @@ function hex(n: number): string { return '0x' + n.toString(16).padStart(2, '0');
 // TX buffer 0 start register
 const TXB0_SIDH = 0x31;
 
-// RX buffer 0 start register
+// RX buffer start registers
 const RXB0_SIDH = 0x61;
+const RXB1_SIDH = 0x71;
 
 // Registers used for READ_STATUS computation
 const CANINTE  = 0x2B;
@@ -121,24 +122,27 @@ export class McpDecoder {
         this.tryLoadNextRxFrame();
     }
 
-    /** If RXB0 is free (CANINTF.RX0IF clear) and queue non-empty, load next frame. */
+    /** Load queued frames into RXB0/RXB1 as they become available. */
     private tryLoadNextRxFrame(): void {
-        if ((this.registers[CANINTF] & RX0IF) === 0 && this.rxQueue.length > 0) {
-            this.loadFrameToRxb0(this.rxQueue.shift()!);
+        if (this.rxQueue.length === 0) return;
+        if ((this.registers[CANINTF] & RX0IF) === 0) {
+            this.loadFrameToRxb(this.rxQueue.shift()!, RXB0_SIDH, RX0IF);
+        } else if ((this.registers[CANINTF] & RX1IF) === 0) {
+            this.loadFrameToRxb(this.rxQueue.shift()!, RXB1_SIDH, RX1IF);
         }
     }
 
-    /** Encode a CAN frame into RXB0 registers and set CANINTF.RX0IF. */
-    private loadFrameToRxb0(frame: CanFrame): void {
-        this.registers[RXB0_SIDH]     = (frame.id >> 3) & 0xFF;
-        this.registers[RXB0_SIDH + 1] = ((frame.id & 0x07) << 5) | 0x08 | ((frame.eid >> 16) & 0x03);
-        this.registers[RXB0_SIDH + 2] = (frame.eid >> 8) & 0xFF;
-        this.registers[RXB0_SIDH + 3] = frame.eid & 0xFF;
-        this.registers[RXB0_SIDH + 4] = frame.dlc;
+    /** Encode a CAN frame into an RX buffer and set the corresponding interrupt flag. */
+    private loadFrameToRxb(frame: CanFrame, base: number, flag: number): void {
+        this.registers[base]     = (frame.id >> 3) & 0xFF;
+        this.registers[base + 1] = ((frame.id & 0x07) << 5) | 0x08 | ((frame.eid >> 16) & 0x03);
+        this.registers[base + 2] = (frame.eid >> 8) & 0xFF;
+        this.registers[base + 3] = frame.eid & 0xFF;
+        this.registers[base + 4] = frame.dlc;
         for (let i = 0; i < frame.dlc; i++) {
-            this.registers[RXB0_SIDH + 5 + i] = frame.data[i];
+            this.registers[base + 5 + i] = frame.data[i];
         }
-        this.registers[CANINTF] |= RX0IF;
+        this.registers[CANINTF] |= flag;
         this.updateIntPin();
     }
 
@@ -317,7 +321,7 @@ export class McpDecoder {
      */
     private computeStatus(): number {
         const canintf = this.registers[CANINTF];
-        return ((canintf >> 0) & 1)
+        const status = ((canintf >> 0) & 1)
              | (((canintf >> 1) & 1) << 1)
              | (((this.registers[TXB0CTRL] >> 3) & 1) << 2)
              | (((canintf >> 2) & 1) << 3)
@@ -325,6 +329,8 @@ export class McpDecoder {
              | (((canintf >> 3) & 1) << 5)
              | (((this.registers[TXB2CTRL] >> 3) & 1) << 6)
              | (((canintf >> 4) & 1) << 7);
+        console.log(`  READ_STATUS -> ${hex(status)} (CANINTF=${hex(canintf)})`);
+        return status;
     }
 
     /**
