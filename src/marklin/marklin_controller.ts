@@ -14,6 +14,7 @@ export class MarklinController {
     private reportSensor: (sensors: boolean[]) => void = null;
     private readonly launchTime: number = new Date().getTime();
     private sensorQuantity: number = -1;
+    private stopped: boolean = false;
 
     public setSensorReportCallback(reportSensor: (sensors: boolean[]) => void) {
         this.reportSensor = reportSensor;
@@ -94,7 +95,23 @@ export class MarklinController {
         }, config.SENSOR_REPORT_DELAY_MS);
     }
 
+    public halt() {
+        for (const train of this.trains.values()) {
+            train.targetSpeed = 0;
+        }
+    }
+
+    public stop() {
+        this.stopped = true;
+    }
+
+    public go() {
+        this.stopped = false;
+    }
+
     public tick(interval: number) {
+        if (this.stopped) return;
+
         for (const train of this.trains.values()) {
             // Change speed
             train.accelerate(interval);

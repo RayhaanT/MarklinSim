@@ -120,6 +120,13 @@ export class Cs3Handler {
     private handleSystem(frame: CanFrame, ack: CanFrame): HandleResult {
         const subcmd = frame.data[4];
         console.log(`[CS3] SYSTEM ${SUBCMD_NAME[subcmd] ?? subcmd}`);
+        if (this.controller) {
+            switch (subcmd) {
+                case STOP_SUBCMD: this.controller.stop(); break;
+                case GO_SUBCMD:   this.controller.go();   break;
+                case HALT_SUBCMD: this.controller.halt();  break;
+            }
+        }
         return { immediate: [ack], delayed: [] };
     }
 
