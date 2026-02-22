@@ -78,6 +78,7 @@ const enum State {
 }
 
 export type TxFrameCallback = (frame: CanFrame) => void;
+export type IntPinChangeCallback = (asserted: boolean) => void;
 
 export class McpDecoder {
     private state: State = State.IDLE;
@@ -89,10 +90,27 @@ export class McpDecoder {
 
     private readonly registers = new Uint8Array(256);
     private txFrameCallback: TxFrameCallback | null = null;
+    private intPinChangeCallback: IntPinChangeCallback | null = null;
     private rxQueue: CanFrame[] = [];
+    private intPinAsserted: boolean = false;
 
     public setTxFrameCallback(cb: TxFrameCallback): void {
         this.txFrameCallback = cb;
+    }
+
+    public setIntPinChangeCallback(cb: IntPinChangeCallback): void {
+        this.intPinChangeCallback = cb;
+    }
+
+    /** Update INT pin state based on CANINTF & CANINTE. Calls callback on change. */
+    private updateIntPin(): void {
+        const shouldAssert = this.shouldTriggerInterrupt();
+        if (shouldAssert !== this.intPinAsserted) {
+            this.intPinAsserted = shouldAssert;
+            if (this.intPinChangeCallback) {
+                this.intPinChangeCallback(shouldAssert);
+            }
+        }
     }
 
     /** Queue CAN frames to be loaded into RXB0 as they become available. */
@@ -121,6 +139,7 @@ export class McpDecoder {
             this.registers[RXB0_SIDH + 5 + i] = frame.data[i];
         }
         this.registers[CANINTF] |= RX0IF;
+        this.updateIntPin();
     }
 
     /**
@@ -162,8 +181,9 @@ export class McpDecoder {
                 if (this.register === TXB0CTRL && (txByte & 0x08)) {
                     this.registers[TXB0CTRL] &= ~0x08;
                 }
-                // When kernel clears CANINTF, load next queued RX frame.
+                // When kernel writes CANINTF, update INT pin and load next queued RX frame.
                 if ((this.register & 0xFF) === CANINTF) {
+                    this.updateIntPin();
                     this.tryLoadNextRxFrame();
                 }
                 this.register = (this.register + 1) & 0xFF;
@@ -222,6 +242,7 @@ export class McpDecoder {
                     (txByte & this.bitModifyMask);
                 console.log(`  BIT_MODIFY reg[${hex(addr)}] mask=${hex(this.bitModifyMask)} data=${hex(txByte)}: ${hex(oldVal)} -> ${hex(this.registers[addr])}`);
                 if (addr === CANINTF) {
+                    this.updateIntPin();
                     this.tryLoadNextRxFrame();
                 }
                 this.state = State.IDLE;
@@ -325,6 +346,7 @@ export class McpDecoder {
 
         // Set TX0IF to indicate transmit buffer is now empty
         this.registers[CANINTF] |= TX0IF;
+        this.updateIntPin();
 
         if (this.txFrameCallback) {
             this.txFrameCallback(frame);

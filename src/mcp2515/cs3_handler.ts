@@ -15,6 +15,7 @@ const SPEED_CMD     = 0x04;
 const DIRECTION_CMD = 0x05;
 const LIGHT_CMD     = 0x06;
 const SWITCH_CMD    = 0x0B;
+const SENSOR_CMD    = 0x11;
 
 // System sub-commands
 const STOP_SUBCMD = 0x00;
@@ -63,6 +64,36 @@ export class Cs3Handler {
 
     public setController(controller: MarklinController): void {
         this.controller = controller;
+    }
+
+    /**
+     * Generate a CS3 sensor event frame.
+     * Command 0x11 (SENSOR_CMD) with sensor ID, old state, and new state.
+     *
+     * @param sensorId Sensor contact ID
+     * @param oldState Previous state (false = not triggered, true = triggered)
+     * @param newState Current state (false = not triggered, true = triggered)
+     */
+    public makeSensorEvent(sensorId: number, oldState: boolean, newState: boolean): CanFrame {
+        // Command 0x11 = 0b00010001
+        // Decompose: ((id << 1) & 0xFE) | ((eid >> 17) & 0x01) = 0x11
+        // Bits 7-1: 0b0001000 = 0x08, so id = 0x08
+        // Bit 0: 1, so eid bit 17 = 1
+        const id = 0x08;
+        const eid = (1 << 17) | (sensorId & 0xFFFF);  // bit 17 set, lower bits = sensor ID
+
+        const data = [
+            (sensorId >> 24) & 0xFF,
+            (sensorId >> 16) & 0xFF,
+            (sensorId >> 8) & 0xFF,
+            sensorId & 0xFF,
+            oldState ? 1 : 0,
+            newState ? 1 : 0,
+            0,  // timestamp high (unused)
+            0   // timestamp low (unused)
+        ];
+
+        return { id, eid, dlc: 8, data };
     }
 
     public handleTxFrame(frame: CanFrame): CanFrame[] {

@@ -19,6 +19,9 @@ export class McpIO {
     private gpioSocket: net.Socket | null = null;
     private readonly decoder: McpDecoder;
     private readonly handler: Cs3Handler;
+    private readonly controller: MarklinController | null = null;
+    private sensorStates: Map<number, boolean> = new Map();
+    private sensorPollInterval: ReturnType<typeof setInterval> | null = null;
 
     constructor(controller?: MarklinController) {
         this.decoder = new McpDecoder();
@@ -26,21 +29,19 @@ export class McpIO {
 
         if (controller) {
             this.handler.setController(controller);
+            this.controller = controller;
         }
 
-        this.decoder.setTxFrameCallback((frame: CanFrame) => {
-            // TX buffer becomes empty - trigger interrupt if TX0IE is enabled
-            if (this.decoder.shouldTriggerInterrupt()) {
-                this.triggerGpioInterrupt();
-            }
+        // INT pin updates automatically when CANINTF changes in the decoder.
+        // No manual trigger calls needed.
+        this.decoder.setIntPinChangeCallback((asserted: boolean) => {
+            this.setGpioIntPin(asserted);
+        });
 
+        this.decoder.setTxFrameCallback((frame: CanFrame) => {
             const ackFrames = this.handler.handleTxFrame(frame);
             if (ackFrames.length > 0) {
                 this.decoder.queueRxFrames(ackFrames);
-                // RX frames queued - trigger interrupt if RX0IE is enabled
-                if (this.decoder.shouldTriggerInterrupt()) {
-                    this.triggerGpioInterrupt();
-                }
             }
         });
     }
@@ -51,6 +52,30 @@ export class McpIO {
         this.socket = net.createConnection({ host, port }, () => {
             this.socket!.setNoDelay(true);
             console.log(`[MCP IO] Connected to SPI.`);
+
+            // Connect to GPIO AFTER SPI is established.
+            // QEMU blocks on SPI port (wait=on), so GPIO port isn't open until
+            // the SPI connection unblocks QEMU.
+            console.log(`[MCP IO] Connecting to QEMU GPIO at ${host}:${gpioPort}...`);
+            this.gpioSocket = net.createConnection({ host, port: gpioPort }, () => {
+                this.gpioSocket!.setNoDelay(true);
+                console.log(`[MCP IO] Connected to GPIO.`);
+                // Initialize INT pin to de-asserted (HIGH).
+                // GPIO pin 17 defaults to LOW in QEMU, so we must set it HIGH
+                // first, otherwise the first assert (LOW) won't be a level change.
+                this.gpioSocket!.write(Buffer.from([17, 1]));
+                this.startSensorPolling();
+            });
+
+            this.gpioSocket.on('close', () => {
+                console.log('[MCP IO] GPIO disconnected. Exiting...');
+                this.stopSensorPolling();
+                process.exit(0);
+            });
+
+            this.gpioSocket.on('error', (err: Error) => {
+                console.error(`[MCP IO] GPIO error: ${err.message}`);
+            });
         });
 
         this.socket.on('data', (data: Buffer) => {
@@ -64,45 +89,101 @@ export class McpIO {
 
         this.socket.on('close', () => {
             console.log('[MCP IO] SPI disconnected. Exiting...');
+            this.stopSensorPolling();
             process.exit(0);
         });
 
         this.socket.on('error', (err: Error) => {
             console.error(`[MCP IO] SPI error: ${err.message}`);
         });
-
-        // Connect to GPIO chardev for triggering interrupts
-        console.log(`[MCP IO] Connecting to QEMU GPIO at ${host}:${gpioPort}...`);
-        this.gpioSocket = net.createConnection({ host, port: gpioPort }, () => {
-            this.gpioSocket!.setNoDelay(true);
-            console.log(`[MCP IO] Connected to GPIO.`);
-        });
-
-        this.gpioSocket.on('close', () => {
-            console.log('[MCP IO] GPIO disconnected. Exiting...');
-            process.exit(0);
-        });
-
-        this.gpioSocket.on('error', (err: Error) => {
-            console.error(`[MCP IO] GPIO error: ${err.message}`);
-        });
     }
 
     /**
-     * Trigger a GPIO interrupt on pin 17.
-     * Sends a rising edge (pin 17 = 1), then falling edge (pin 17 = 0)
-     * to trigger the MCP2515 interrupt handler in the kernel.
+     * Set the MCP2515 INT pin level on GPIO pin 17.
+     * INT is active-low: asserted=true means pin LOW, asserted=false means pin HIGH.
      */
-    private triggerGpioInterrupt(): void {
+    private setGpioIntPin(asserted: boolean): void {
         if (!this.gpioSocket) {
             return;
         }
         // Protocol: [pin_number, level]
-        // Rising edge on pin 17
-        console.log('[MCP IO] Interrupting on GPIO pin');
-        this.gpioSocket.write(Buffer.from([17, 1]));
-        // Falling edge on pin 17 (clear interrupt line)
-        this.gpioSocket.write(Buffer.from([17, 0]));
+        // Active-low: asserted -> pin LOW (0), de-asserted -> pin HIGH (1)
+        const level = asserted ? 0 : 1;
+        console.log(`[MCP IO] INT pin ${asserted ? 'asserted (LOW)' : 'de-asserted (HIGH)'}`);
+        this.gpioSocket.write(Buffer.from([17, level]));
+    }
+
+    /**
+     * Start polling sensors for state changes.
+     * Checks sensor states every 100ms and sends CAN frames for any changes.
+     */
+    private startSensorPolling(): void {
+        if (!this.controller || this.sensorPollInterval) {
+            return;
+        }
+
+        console.log('[MCP IO] Starting sensor polling');
+
+        // Poll every 100ms
+        this.sensorPollInterval = setInterval(() => {
+            this.pollSensors();
+        }, 100);
+    }
+
+    /**
+     * Stop polling sensors and clean up.
+     */
+    private stopSensorPolling(): void {
+        if (this.sensorPollInterval) {
+            clearInterval(this.sensorPollInterval);
+            this.sensorPollInterval = null;
+        }
+    }
+
+    /**
+     * Check all trains for sensor triggers and send events for state changes.
+     */
+    private pollSensors(): void {
+        if (!this.controller) {
+            return;
+        }
+
+        // Build current sensor states
+        const currentStates = new Map<number, boolean>();
+        for (const train of this.controller.getTrains()) {
+            for (const sensor of train.getTriggeredSensors()) {
+                currentStates.set(sensor.id, true);
+            }
+        }
+
+        // Detect changes
+        const events: CanFrame[] = [];
+
+        // Check for newly triggered sensors
+        for (const [sensorId, newState] of currentStates) {
+            const oldState = this.sensorStates.get(sensorId) ?? false;
+            if (newState !== oldState) {
+                console.log(`[MCP IO] Sensor ${sensorId}: ${oldState ? 'triggered' : 'idle'} -> ${newState ? 'triggered' : 'idle'}`);
+                events.push(this.handler.makeSensorEvent(sensorId, oldState, newState));
+            }
+        }
+
+        // Check for newly released sensors
+        for (const [sensorId, oldState] of this.sensorStates) {
+            if (!currentStates.has(sensorId)) {
+                // Sensor was triggered, now released
+                console.log(`[MCP IO] Sensor ${sensorId}: triggered -> idle`);
+                events.push(this.handler.makeSensorEvent(sensorId, oldState, false));
+            }
+        }
+
+        // Update tracked state
+        this.sensorStates = currentStates;
+
+        // Queue sensor events — INT pin updates automatically via decoder callback
+        if (events.length > 0) {
+            this.decoder.queueRxFrames(events);
+        }
     }
 }
 
